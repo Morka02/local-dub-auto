@@ -1,0 +1,206 @@
+﻿name: Auto Dub from Drive
+
+# NEXT-LEVEL FLOW (no buttons):
+#   1. Drop any number of videos into Google Drive "DubInbox".
+#   2. Every 20 minutes this workflow wakes up, dubs ALL of them (oldest
+#      first), drops results in "DubDone", archives originals to
+#      DubInbox/archive. If the inbox is empty it exits in ~20 seconds.
+#   3. Manual "Run workflow" still works and lets you override languages etc.
+#
+# Required secret: RCLONE_CONF (rclone Google Drive config text).
+# Optional secret: DUB_BASE_URL.
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+    inputs:
+      src:
+        description: "Source language"
+        default: "Hindi"
+        required: false
+      target:
+        description: "Target language"
+        default: "English"
+        required: false
+      genre:
+        description: "Genre (monologue, podcast, ott_movie_sequence, advertisement, edtech, academic_lecture_formal)"
+        default: "monologue"
+        required: false
+      speakers:
+        description: "Number of speakers"
+        default: "1"
+        required: false
+      chunk:
+        description: "Seconds per chunk (60 = clean + fast)"
+        default: "60"
+        required: false
+      workers:
+        description: "Max chunks dubbing at once"
+        default: "8"
+        required: false
+      tries:
+        description: "Retries per chunk"
+        default: "5"
+        required: false
+      inbox:
+        description: "Drive inbox folder"
+        default: "DubInbox"
+        required: false
+      outbox:
+        description: "Drive output folder"
+        default: "DubDone"
+        required: false
+
+# Never two runs at once; queued cron runs collapse into one pending run.
+concurrency:
+  group: dub-drive
+  cancel-in-progress: false
+
+env:
+  SRC: ${{ github.event.inputs.src || 'Hindi' }}
+  TGT: ${{ github.event.inputs.target || 'English' }}
+  GENRE: ${{ github.event.inputs.genre || 'monologue' }}
+  SPEAKERS: ${{ github.event.inputs.speakers || '1' }}
+  CHUNK: ${{ github.event.inputs.chunk || '60' }}
+  WORKERS: ${{ github.event.inputs.workers || '8' }}
+  TRIES: ${{ github.event.inputs.tries || '5' }}
+  INBOX: ${{ github.event.inputs.inbox || 'DubInbox' }}
+  OUTBOX: ${{ github.event.inputs.outbox || 'DubDone' }}
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Connect Google Drive (rclone)
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          if [ -z "$RCLONE_CONF" ]; then
+            echo "::error::RCLONE_CONF secret is not set."
+            exit 1
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "rclone configured."
+
+      - name: Scan inbox (exits fast when empty)
+        id: scan
+        run: |
+          rclone lsjson "gdrive:${INBOX}" --files-only 2>/dev/null | python3 list_videos.py > queue.txt || true
+          COUNT=$(grep -c . queue.txt || true)
+          [ -z "$COUNT" ] && COUNT=0
+          echo "Found $COUNT video(s) in ${INBOX}."
+          cat queue.txt
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Install ffmpeg + python deps
+        if: steps.scan.outputs.count != '0'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install -q --upgrade pip requests
+
+      - name: Dub every video in the queue
+        if: steps.scan.outputs.count != '0'
+        env:
+          DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
+        run: |
+          mkdir -p all_output
+          BUDGET=18000   # ~5h of work max; leftovers go to the next run
+          while IFS= read -r NAME; do
+            [ -z "$NAME" ] && continue
+            if [ "$SECONDS" -gt "$BUDGET" ]; then
+              echo "::warning::Time budget reached - remaining videos stay in ${INBOX} for the next run."
+              break
+            fi
+            echo "=================================================="
+            echo "==> Dubbing: $NAME"
+            echo "=================================================="
+            rm -rf input output "$GITHUB_WORKSPACE"/work_* || true
+            mkdir -p input output
+            rclone copy "gdrive:${INBOX}/${NAME}" input/ --drive-chunk-size 64M -v
+            IN=$(ls input/ | head -n1)
+            if [ -z "$IN" ]; then
+              echo "::warning::Could not download $NAME - skipping."
+              continue
+            fi
+            COMMON="--src $SRC --target $TGT --genre $GENRE --speakers $SPEAKERS --dir $GITHUB_WORKSPACE/output --chunk $CHUNK --workers $WORKERS --tries $TRIES"
+
+            # Pass 1: full run (chunks cached in work_*/chunks).
+            python dub_video.py "$GITHUB_WORKSPACE/input/$IN" $COMMON || true
+
+            # Retry passes: only missing chunks are re-dubbed each pass.
+            WORKDIR=$(ls -d "$GITHUB_WORKSPACE"/work_* 2>/dev/null | head -n1)
+            if [ -n "$WORKDIR" ] && [ -d "$WORKDIR/chunks" ]; then
+              MAX_PASSES=5
+              PASS=0
+              while :; do
+                TOTAL=$(ls "$WORKDIR/chunks"/part_*.mp4 2>/dev/null | wc -l)
+                DONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
+                MISSING=$(( TOTAL - DONE ))
+                echo "::notice::$NAME - $DONE/$TOTAL chunks done, $MISSING missing (pass $PASS)."
+                if [ "$MISSING" -le 0 ]; then echo "All chunks complete."; break; fi
+                PASS=$(( PASS + 1 ))
+                if [ "$PASS" -gt "$MAX_PASSES" ]; then
+                  echo "::warning::$NAME - $MISSING chunk(s) still missing after $MAX_PASSES passes."
+                  break
+                fi
+                PREV=$DONE
+                python dub_video.py "$WORKDIR/chunks" $COMMON || true
+                NOWDONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
+                if [ "$NOWDONE" -le "$PREV" ]; then
+                  echo "No new chunks this pass; cooling down 30s..."
+                  sleep 30
+                fi
+              done
+
+              # Ship still-failed chunks next to the video for a manual re-run.
+              STEM="${IN%.*}"
+              FAILDIR="$GITHUB_WORKSPACE/output/${STEM}_FAILED_CHUNKS"
+              FAILED_LIST=""
+              for p in "$WORKDIR/chunks"/part_*.mp4; do
+                [ -e "$p" ] || continue
+                base=$(basename "$p")
+                num="${base#part_}"; num="${num%.mp4}"
+                if [ ! -e "$WORKDIR/chunks/dub_${num}.mp4" ]; then
+                  mkdir -p "$FAILDIR"
+                  cp "$p" "$FAILDIR/$base"
+                  FAILED_LIST="$FAILED_LIST $num"
+                fi
+              done
+              if [ -n "$FAILED_LIST" ]; then
+                {
+                  echo "These chunks failed after $TRIES tries and are SILENT in the video."
+                  echo "Failed chunk numbers:$FAILED_LIST"
+                } > "$FAILDIR/README_FAILED.txt"
+                echo "::warning::$NAME - failed chunks saved to ${STEM}_FAILED_CHUNKS:$FAILED_LIST"
+              fi
+            fi
+
+            # Upload + archive THIS video (per-video, so one bad video never
+            # blocks the rest of the queue).
+            if [ -n "$(ls -A output/ 2>/dev/null)" ]; then
+              rclone copy output/ "gdrive:${OUTBOX}" --transfers 1 --drive-chunk-size 64M -v
+              rclone moveto "gdrive:${INBOX}/${NAME}" "gdrive:${INBOX}/archive/${NAME}" -v || \
+                echo "::warning::Could not archive ${NAME}."
+              cp -r output/* all_output/ 2>/dev/null || true
+              echo "==> ${NAME} done -> ${OUTBOX} (original archived)."
+            else
+              echo "::warning::${NAME} produced no output - left in ${INBOX} for the next run."
+            fi
+          done < queue.txt
+
+      - name: Backup copy in Artifacts
+        if: steps.scan.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dubbed-videos
+          path: all_output/**
+          retention-days: 30
+          if-no-files-found: warn
