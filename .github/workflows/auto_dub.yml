@@ -1,4 +1,4 @@
-name: Auto Dub from Drive
+﻿name: Auto Dub from Drive
 
 # SOURCES (all automatic):
 #   1. Video files dropped in Drive "DubInbox".
@@ -153,7 +153,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          python3 -m pip install -q --upgrade pip requests yt-dlp bgutil-ytdlp-pot-provider
+          python3 -m pip install -q --upgrade pip requests "yt-dlp[default]" yt-dlp-ejs bgutil-ytdlp-pot-provider
 
       - name: Get the video (Drive file or yt-dlp)
         id: get
