@@ -11,6 +11,10 @@ Fully automatic Hindi -> English (or any supported pair) video dubbing.
 Manual runs (Actions tab -> "Auto Dub from Drive" -> Run workflow) let you
 override language, genre, chunk size, etc.
 
+## YouTube links (yt-dlp)
+Drop a `.txt` file in DubInbox with one YouTube URL per line - each link is
+downloaded on its own runner and dubbed. Or use the manual run's `url` input.
+
 ## Setup
 Add repo secret **RCLONE_CONF** = your rclone Google Drive config text.
 
@@ -19,3 +23,4 @@ Add repo secret **RCLONE_CONF** = your rclone Google Drive config text.
 - Failed chunks ship next to the video in `*_FAILED_CHUNKS` with a README.
 - GitHub pauses cron schedules after ~60 days with no repo activity; any
   commit re-enables them.
+

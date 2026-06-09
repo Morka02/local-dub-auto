@@ -1,18 +1,28 @@
 ﻿name: Auto Dub from Drive
 
-# SPEED ARCHITECTURE:
-#   - Cron every 5 min; empty inbox = one tiny scan job (~20s) and done.
-#   - scan job lists DubInbox, then FANS OUT one runner PER VIDEO
-#     (up to 4 at once) - 4 videos dub in the time of 1.
-#   - Within each video, chunks dub in parallel (workers, default 8).
+# SOURCES (all automatic):
+#   1. Video files dropped in Drive "DubInbox".
+#   2. YouTube links: drop a .txt file in DubInbox with one URL per line.
+#      The links file is archived immediately; each URL gets its own runner
+#      which downloads via yt-dlp (cookies supported) and dubs it.
+#   3. Manual run with the "url" input for a one-off link.
 #
-# Required secret: RCLONE_CONF. Optional: DUB_BASE_URL.
+# Cron every 5 min; empty inbox = one tiny scan job. Up to 4 videos dub in
+# parallel; chunks within a video dub in parallel too (workers, default 8).
+# Normal mode only - no turbo (long videos).
+#
+# Secrets: RCLONE_CONF (required), YT_COOKIES_B64 (recommended for YouTube),
+#          DUB_BASE_URL (optional).
 
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
+      url:
+        description: "YouTube/video URL to dub (optional one-off)"
+        default: ""
+        required: false
       src:
         description: "Source language"
         default: "Hindi"
@@ -55,6 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  URL: ${{ github.event.inputs.url || '' }}
   SRC: ${{ github.event.inputs.src || 'Hindi' }}
   TGT: ${{ github.event.inputs.target || 'English' }}
   GENRE: ${{ github.event.inputs.genre || 'monologue' }}
@@ -88,14 +99,31 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: Scan inbox
+      - name: Scan inbox (videos + link files)
         id: scan
         run: |
+          # 1) Video files waiting in the inbox.
           rclone lsjson "gdrive:${INBOX}" --files-only 2>/dev/null | python3 list_videos.py > queue.txt || true
-          COUNT=$(grep -c . queue.txt || true)
-          [ -z "$COUNT" ] && COUNT=0
-          QUEUE=$(python3 -c "import json; print(json.dumps([l.rstrip() for l in open('queue.txt') if l.strip()]))")
-          echo "Found $COUNT video(s): $QUEUE"
+
+          # 2) Link files (*.txt): read their URLs, then archive them right away
+          #    so the next cron tick never re-queues the same links.
+          touch links_raw.txt
+          rclone lsf "gdrive:${INBOX}" --files-only --include "*.txt" 2>/dev/null | while IFS= read -r T; do
+            [ -z "$T" ] && continue
+            echo "Reading links file: $T"
+            rclone cat "gdrive:${INBOX}/${T}" >> links_raw.txt || true
+            echo "" >> links_raw.txt
+            rclone moveto "gdrive:${INBOX}/${T}" "gdrive:${INBOX}/archive/${T}" || true
+          done
+
+          # 3) Manual one-off URL from the Run-workflow form.
+          if [ -n "$URL" ]; then
+            echo "$URL" >> links_raw.txt
+          fi
+
+          QUEUE=$(python3 build_queue.py)
+          COUNT=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$QUEUE")
+          echo "Queue ($COUNT item(s)): $QUEUE"
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "queue=$QUEUE" >> "$GITHUB_OUTPUT"
 
@@ -108,7 +136,7 @@ jobs:
       fail-fast: false
       max-parallel: 4          # 4 videos dub simultaneously
       matrix:
-        video: ${{ fromJSON(needs.scan.outputs.queue) }}
+        item: ${{ fromJSON(needs.scan.outputs.queue) }}
     steps:
       - name: Get the code
         uses: actions/checkout@v4
@@ -125,24 +153,55 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          python3 -m pip install -q --upgrade pip requests
+          python3 -m pip install -q --upgrade pip requests yt-dlp
+
+      - name: Get the video (Drive file or yt-dlp)
+        id: get
+        env:
+          KIND: ${{ matrix.item.kind }}
+          REF: ${{ matrix.item.ref }}
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+        run: |
+          mkdir -p input output
+          if [ "$KIND" = "file" ]; then
+            # Skip if another run already archived it.
+            if ! rclone lsf "gdrive:${INBOX}/${REF}" >/dev/null 2>&1; then
+              echo "::notice::${REF} no longer in ${INBOX} - already handled."
+              echo "have=no" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            rclone copy "gdrive:${INBOX}/${REF}" input/ --drive-chunk-size 64M -v
+          else
+            CK=""
+            if [ -n "$YT_COOKIES_B64" ]; then
+              printf '%s' "$YT_COOKIES_B64" | base64 -d > cookies.txt && CK="--cookies cookies.txt"
+              echo "Using YouTube cookies."
+            fi
+            yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+              --merge-output-format mp4 --concurrent-fragments 18 --no-mtime \
+              --no-playlist --ignore-errors --no-overwrites --no-warnings \
+              $CK -o "input/%(title).100s-%(id)s.%(ext)s" "$REF" || true
+          fi
+          IN=$(ls input/ 2>/dev/null | head -n1)
+          if [ -z "$IN" ]; then
+            echo "::error::Could not get video for: $REF"
+            echo "FAILED TO FETCH: $REF" > output/FAILED_LINK.txt
+            rclone copy output/ "gdrive:${OUTBOX}" -v || true
+            echo "have=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "have=yes" >> "$GITHUB_OUTPUT"
+          echo "Got: $IN"
 
       - name: Dub this video
+        if: steps.get.outputs.have == 'yes'
         env:
           DUB_BASE_URL: ${{ secrets.DUB_BASE_URL }}
-          NAME: ${{ matrix.video }}
+          KIND: ${{ matrix.item.kind }}
+          REF: ${{ matrix.item.ref }}
         run: |
-          echo "==> Dubbing: $NAME"
-          # If another runner (or a previous run) already archived it, skip.
-          if ! rclone lsf "gdrive:${INBOX}/${NAME}" >/dev/null 2>&1; then
-            echo "::notice::$NAME no longer in ${INBOX} - already handled. Skipping."
-            exit 0
-          fi
-          mkdir -p input output
-          rclone copy "gdrive:${INBOX}/${NAME}" input/ --drive-chunk-size 64M -v
           IN=$(ls input/ | head -n1)
-          if [ -z "$IN" ]; then echo "::error::Download failed for $NAME"; exit 1; fi
-
+          echo "==> Dubbing: $IN"
           COMMON="--src $SRC --target $TGT --genre $GENRE --speakers $SPEAKERS --dir $GITHUB_WORKSPACE/output --chunk $CHUNK --workers $WORKERS --tries $TRIES"
 
           python dub_video.py "$GITHUB_WORKSPACE/input/$IN" $COMMON || true
@@ -155,11 +214,11 @@ jobs:
               TOTAL=$(ls "$WORKDIR/chunks"/part_*.mp4 2>/dev/null | wc -l)
               DONE=$(ls "$WORKDIR/chunks"/dub_*.mp4 2>/dev/null | wc -l)
               MISSING=$(( TOTAL - DONE ))
-              echo "::notice::$NAME - $DONE/$TOTAL chunks done, $MISSING missing (pass $PASS)."
+              echo "::notice::$IN - $DONE/$TOTAL chunks done, $MISSING missing (pass $PASS)."
               if [ "$MISSING" -le 0 ]; then echo "All chunks complete."; break; fi
               PASS=$(( PASS + 1 ))
               if [ "$PASS" -gt "$MAX_PASSES" ]; then
-                echo "::warning::$NAME - $MISSING chunk(s) still missing after $MAX_PASSES passes."
+                echo "::warning::$IN - $MISSING chunk(s) still missing after $MAX_PASSES passes."
                 break
               fi
               PREV=$DONE
@@ -189,17 +248,19 @@ jobs:
                 echo "These chunks failed after $TRIES tries and are SILENT in the video."
                 echo "Failed chunk numbers:$FAILED_LIST"
               } > "$FAILDIR/README_FAILED.txt"
-              echo "::warning::$NAME - failed chunks saved:$FAILED_LIST"
+              echo "::warning::$IN - failed chunks saved:$FAILED_LIST"
             fi
           fi
 
           if [ -n "$(ls -A output/ 2>/dev/null)" ]; then
             rclone copy output/ "gdrive:${OUTBOX}" --transfers 2 --drive-chunk-size 64M -v
-            rclone moveto "gdrive:${INBOX}/${NAME}" "gdrive:${INBOX}/archive/${NAME}" -v || \
-              echo "::warning::Could not archive ${NAME}."
-            echo "==> ${NAME} done -> ${OUTBOX}."
+            if [ "$KIND" = "file" ]; then
+              rclone moveto "gdrive:${INBOX}/${REF}" "gdrive:${INBOX}/archive/${REF}" -v || \
+                echo "::warning::Could not archive ${REF}."
+            fi
+            echo "==> $IN done -> ${OUTBOX}."
           else
-            echo "::error::${NAME} produced no output - left in ${INBOX} for the next run."
+            echo "::error::$IN produced no output."
             exit 1
           fi
 
@@ -211,4 +272,3 @@ jobs:
           path: output/**
           retention-days: 30
           if-no-files-found: ignore
-
