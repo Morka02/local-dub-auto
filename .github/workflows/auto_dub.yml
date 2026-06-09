@@ -110,15 +110,19 @@ jobs:
           touch links_raw.txt
           rclone lsf "gdrive:${INBOX}" --files-only --include "*.txt" 2>/dev/null | while IFS= read -r T; do
             [ -z "$T" ] && continue
-            echo "Reading links file: $T"
-            rclone cat "gdrive:${INBOX}/${T}" >> links_raw.txt || true
+            TRYN=0
+            case "$T" in
+              retry_*) TRYN=$(echo "$T" | sed -n "s/^retry_\([0-9]*\)_.*/\1/p"); [ -z "$TRYN" ] && TRYN=0 ;;
+            esac
+            echo "Reading links file: $T (attempt $TRYN)"
+            rclone cat "gdrive:${INBOX}/${T}" | sed "s/^/${TRYN} /" >> links_raw.txt || true
             echo "" >> links_raw.txt
             rclone moveto "gdrive:${INBOX}/${T}" "gdrive:${INBOX}/archive/${T}" || true
           done
 
           # 3) Manual one-off URL from the Run-workflow form.
           if [ -n "$URL" ]; then
-            echo "$URL" >> links_raw.txt
+            echo "0 $URL" >> links_raw.txt
           fi
 
           QUEUE=$(python3 build_queue.py)
@@ -160,6 +164,7 @@ jobs:
         env:
           KIND: ${{ matrix.item.kind }}
           REF: ${{ matrix.item.ref }}
+          TRYN: ${{ matrix.item.try }}
           YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
           YT_PROXY: ${{ secrets.YT_PROXY }}
         run: |
@@ -196,10 +201,23 @@ jobs:
               $CK $PX -o "input/%(title).100s-%(id)s.%(ext)s" "$REF" || true
           fi
           IN=$(ls input/ 2>/dev/null | head -n1)
-          if [ -z "$IN" ]; then
+          if [ -z "$IN" ] && [ "$KIND" = "url" ]; then
+            MAXTRY=3
+            NEXT=$(( ${TRYN:-0} + 1 ))
+            if [ "$NEXT" -le "$MAXTRY" ]; then
+              RT="retry_${NEXT}_$(date +%s)$RANDOM.txt"
+              echo "$REF" > "$RT"
+              rclone copy "$RT" "gdrive:${INBOX}" -v || true
+              echo "::warning::Download failed - re-queued as $RT (attempt $NEXT/$MAXTRY): $REF"
+            else
+              echo "FAILED TO FETCH after $MAXTRY retries: $REF" > output/FAILED_LINK.txt
+              rclone copy output/ "gdrive:${OUTBOX}" -v || true
+              echo "::error::Giving up on $REF after $MAXTRY retries."
+            fi
+            echo "have=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          elif [ -z "$IN" ]; then
             echo "::error::Could not get video for: $REF"
-            echo "FAILED TO FETCH: $REF" > output/FAILED_LINK.txt
-            rclone copy output/ "gdrive:${OUTBOX}" -v || true
             echo "have=no" >> "$GITHUB_OUTPUT"
             exit 1
           fi
