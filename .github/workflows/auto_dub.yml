@@ -15,8 +15,6 @@ name: Auto Dub from Drive
 #          DUB_BASE_URL (optional).
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       url:
