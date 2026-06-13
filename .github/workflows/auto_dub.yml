@@ -1,4 +1,4 @@
-﻿name: Auto Dub from Drive
+name: Auto Dub from Drive
 
 # SOURCES (all automatic):
 #   1. Video files dropped in Drive "DubInbox".
@@ -138,7 +138,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 4          # 4 videos dub simultaneously
+      max-parallel: 20          # 4 videos dub simultaneously
       matrix:
         item: ${{ fromJSON(needs.scan.outputs.queue) }}
     steps:
